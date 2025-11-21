@@ -152,9 +152,6 @@ def load_asr_pipeline():
         generate_kwargs={
             "task": "transcribe",
             "language": None,  # auto-detect (pt/en/es, etc)
-            "return_timestamps": True,
-            "use_timestamps": "word",  # ensures WhisperTimeStampLogitsProcessor is used
-            "condition_on_previous_text": False,
         },
     )
 
@@ -164,7 +161,7 @@ def generate_subtitles(video_path: str) -> tuple[str, str]:
     """Generate SRT subtitles using Whisper and return (srt_text, srt_file_path)."""
     voice_boosted_path = enhance_voice_for_asr(video_path)
     asr = load_asr_pipeline()
-    result = asr(voice_boosted_path, return_timestamps=True)
+    result = asr(voice_boosted_path, return_timestamps="word")
 
     # Hugging Face Whisper returns chunks in a "chunks" list with start/end
     chunks = result.get("chunks") or []
