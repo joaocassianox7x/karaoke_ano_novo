@@ -1,6 +1,7 @@
 import json
 import http.server
 import threading
+import sys
 from pathlib import Path
 import tempfile
 from typing import Callable, Optional
@@ -63,8 +64,15 @@ def start_media_server(root: Path) -> str:
             # Silence base HTTP logs
             return
 
+    class QuietServer(http.server.ThreadingHTTPServer):
+        def handle_error(self, request, client_address):  # noqa: D401
+            exc = sys.exc_info()[1]
+            if isinstance(exc, BrokenPipeError):
+                return  # ignore client disconnects
+            return super().handle_error(request, client_address)
+
     handler = lambda *args, **kwargs: QuietHandler(*args, directory=str(root), **kwargs)  # noqa: E731
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server = QuietServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -148,7 +156,8 @@ def load_asr_pipeline():
         "automatic-speech-recognition",
         model="openai/whisper-small",
         device="cpu",  # set to "cuda" if you have a GPU available
-        chunk_length_s=30,
+        chunk_length_s=None,  # let Whisper manage chunking to avoid experimental warnings
+        ignore_warning=True,
         generate_kwargs={
             "task": "transcribe",
             "language": None,  # auto-detect (pt/en/es, etc)
