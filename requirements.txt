@@ -1,0 +1,4 @@
+pydub==0.25.1
+streamlit==1.51.0
+transformers==4.57.1
+yt_dlp==2025.11.12
