@@ -1,18 +1,62 @@
+import base64
 import json
 import http.server
 import threading
 import sys
 from pathlib import Path
 import tempfile
+from mimetypes import guess_type
+import io
+import math
+import time
+import numpy as np
+import torch
+import difflib
 from typing import Callable, Optional
 
 import streamlit as st
 
 
 st.set_page_config(page_title="YouTube Loader", page_icon="📥")
+st.markdown(
+    """
+    <style>
+      body { background: linear-gradient(135deg, #0f172a 0%, #111827 40%, #0b1224 100%); color: #e5e7eb; }
+      section.main > div { padding-top: 12px; }
+      .block-container {
+        padding: 28px 24px 32px 24px;
+        border-radius: 14px;
+        background: rgba(255,255,255,0.02);
+        border: 1px solid rgba(255,255,255,0.04);
+        box-shadow: 0 10px 40px rgba(0,0,0,0.28);
+      }
+      h1, h2, h3, h4 { color: #f8fafc; }
+      .stButton>button {
+        background: linear-gradient(135deg, #22c55e, #10b981);
+        color: #0f172a;
+        border: none;
+        border-radius: 10px;
+        padding: 10px 16px;
+        font-weight: 700;
+        box-shadow: 0 10px 30px rgba(16,185,129,0.35);
+      }
+      .stButton>button:hover { filter: brightness(1.05); }
+      .stProgress > div > div {
+        background: linear-gradient(90deg, #3b82f6, #22c55e);
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 MEDIA_ROOT = Path(tempfile.gettempdir()) / "karaoke_ano_novo"
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+
+COMPONENT_DIR = (Path(__file__).parent / "web_recorder").resolve()
+karaoke_recorder_component = st.components.v1.declare_component(
+    "karaoke_recorder",
+    path=str(COMPONENT_DIR),
+)
 
 
 class StepProgress:
@@ -57,6 +101,7 @@ def start_media_server(root: Path) -> str:
         return saved["base"]
 
     class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
         def __init__(self, *args, directory=None, **kwargs):
             super().__init__(*args, directory=directory, **kwargs)
 
@@ -64,11 +109,17 @@ def start_media_server(root: Path) -> str:
             # Silence base HTTP logs
             return
 
+        def end_headers(self):
+            # Allow media to be fetched from the Streamlit iframe (different port)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            super().end_headers()
+
     class QuietServer(http.server.ThreadingHTTPServer):
         def handle_error(self, request, client_address):  # noqa: D401
             exc = sys.exc_info()[1]
-            if isinstance(exc, BrokenPipeError):
-                return  # ignore client disconnects
+            # Ignore common disconnect errors when the browser stops the stream mid-transfer
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                return
             return super().handle_error(request, client_address)
 
     handler = lambda *args, **kwargs: QuietHandler(*args, directory=str(root), **kwargs)  # noqa: E731
@@ -82,8 +133,46 @@ def start_media_server(root: Path) -> str:
     return base_url
 
 
+def _streamlit_media_url(path: Path) -> Optional[str]:
+    """
+    Register the media file with Streamlit's own media endpoint so it is served
+    from the same origin/port as the app (works on hosted/cloud environments).
+    """
+    mgr = None
+    try:
+        from streamlit.runtime.media_file_manager import media_file_manager as mgr  # type: ignore
+    except Exception:
+        try:
+            from streamlit.media_file_manager import media_file_manager as mgr  # type: ignore
+        except Exception:
+            try:
+                import streamlit.runtime as rt  # type: ignore
+                mgr = rt.get_instance().media_file_manager  # type: ignore
+            except Exception:
+                add_log("Streamlit media manager not available; falling back to local server")
+                return None
+
+    mimetype, _ = guess_type(str(path))
+    try:
+        media_id = mgr.add(str(path), mimetype or "application/octet-stream", file_name=path.name)
+        url = mgr.get_url(media_id)
+        add_log(f"Serving via Streamlit media endpoint: {url}")
+        return url
+    except Exception as exc:
+        add_log(f"Could not register media with Streamlit: {exc}")
+        return None
+
+
 def ensure_media_url(video_path: Path) -> str:
-    """Return an HTTP URL for the video, starting the local server if needed."""
+    """
+    Return an HTTP URL for the video. Prefer Streamlit's built-in media handler
+    (same origin), and fall back to the lightweight local HTTP server.
+    """
+    # Best effort: same-origin media avoids mixed-content / port exposure issues
+    media_url = _streamlit_media_url(video_path)
+    if media_url:
+        return media_url
+
     base = start_media_server(video_path.parent)
     return f"{base}/{video_path.name}"
 
@@ -154,7 +243,7 @@ def load_asr_pipeline():
     # Small model gives better multilingual quality and still runs locally on CPU (slower than tiny).
     return pipeline(
         "automatic-speech-recognition",
-        model="openai/whisper-small",
+        model="openai/whisper-tiny",
         device="cpu",  # set to "cuda" if you have a GPU available
         chunk_length_s=None,  # let Whisper manage chunking to avoid experimental warnings
         ignore_warning=True,
@@ -235,95 +324,34 @@ def enhance_voice_for_asr(video_path: str) -> str:
 
 
 def render_video_with_subtitles(video_path: Path, srt_text: str):
-    """Render a video with subtitles and a karaoke-style highlight of the spoken line."""
-    cues = parse_srt_cues(srt_text)
-    cues_json = json.dumps(cues)
-
-    video_uri = ensure_media_url(video_path)
-
-    html = f"""
-    <style>
-      .karaoke-container {{
-        width: 100%;
-        max-width: 960px;
-        margin: 0 auto;
-      }}
-      .karaoke-line {{
-        margin-top: 12px;
-        padding: 12px 16px;
-        background: #111;
-        color: #f4f4f4;
-        border-radius: 6px;
-        font-size: 1.1rem;
-        font-weight: 600;
-        min-height: 56px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        text-align: center;
-        overflow: hidden;
-      }}
-      .karaoke-line.active {{
-        box-shadow: 0 0 12px rgba(255, 212, 71, 0.35);
-      }}
-      .karaoke-text {{
-        --progress: 0%;
-        background-image: linear-gradient(
-          90deg,
-          #ffd447 0%,
-          #ffd447 var(--progress),
-          #f4f4f4 var(--progress),
-          #f4f4f4 100%
-        );
-        -webkit-background-clip: text;
-        background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-fill-color: transparent;
-        transition: background-position 0.05s linear;
-        white-space: pre-wrap;
-      }}
-    </style>
-    <div class="karaoke-container">
-      <video id="karaoke-video" controls width="100%" crossorigin="anonymous">
-        <source src="{video_uri}" type="video/mp4">
-        Your browser does not support the video tag.
-      </video>
-      <div id="karaoke-line" class="karaoke-line">
-        <span id="karaoke-text" class="karaoke-text">Loading subtitles...</span>
-      </div>
-    </div>
-    <script>
-      const cues = {cues_json};
-      const video = document.getElementById("karaoke-video");
-      const line = document.getElementById("karaoke-line");
-      const textSpan = document.getElementById("karaoke-text");
-      let lastText = "";
-
-      function updateLine() {{
-        if (!video || !cues.length) return;
-        const t = video.currentTime;
-        const cue = cues.find(c => t >= c.start && t <= c.end);
-        const text = cue ? cue.text : "";
-        const duration = cue ? Math.max(cue.end - cue.start, 0.001) : 1;
-        const progress = cue ? Math.min(Math.max((t - cue.start) / duration, 0), 1) : 0;
-
-        if (text !== lastText) {{
-          textSpan.textContent = text || "♪";
-          line.classList.toggle("active", !!cue);
-          lastText = text;
-        }}
-        // Avoid Python f-string interpolation; build string in JS.
-        textSpan.style.setProperty("--progress", (progress * 100) + "%");
-        requestAnimationFrame(updateLine);
-      }}
-
-      video?.addEventListener("loadedmetadata", () => {{
-        textSpan.textContent = "Ready to play";
-        requestAnimationFrame(updateLine);
-      }});
-    </script>
     """
-    st.components.v1.html(html, height=560)
+    Render a video and feed subtitles via a native <track> element. The track
+    is created from the SRT on the fly (converted to WebVTT) so browsers show
+    the captions without custom JS syncing. Recording starts automatically when
+    the video plays.
+    """
+    video_uri = ensure_media_url(video_path)
+    cues = parse_srt_cues(srt_text)
+    vtt_text = srt_to_webvtt(srt_text)
+
+    result = karaoke_recorder_component(
+        label="Recording with playback (starts when video plays)",
+        videoUrl=video_uri,
+        cues=cues,
+        vttText=vtt_text,
+        autoStartOnPlay=True,
+        key="karaoke_player",
+    )
+
+    if isinstance(result, dict) and result.get("status") == "recorded" and result.get("b64"):
+        try:
+            b64_str = result["b64"].split(",")[-1]
+            st.session_state["recorded_singing"] = base64.b64decode(b64_str)
+            st.session_state["recorded_singing_trigger"] = result.get("trigger", "manual")
+            st.session_state["recorded_singing_version"] = time.time()
+            add_log(f"Captured singing recording from playback (trigger={result.get('trigger', 'manual')})")
+        except Exception as exc:
+            add_log(f"Could not decode singing recording: {exc}")
 
 
 def parse_srt_cues(srt_text: str) -> list[dict]:
@@ -372,6 +400,226 @@ def _parse_block(lines: list[str], ts_to_seconds: Callable[[str], float]) -> lis
     return cues
 
 
+def _segment_audio(source) -> "AudioSegment":
+    """Load an audio segment from path, file-like, or bytes."""
+    from pydub import AudioSegment  # lazy import
+
+    if isinstance(source, Path):
+        return AudioSegment.from_file(source)
+    if isinstance(source, (bytes, bytearray)):
+        return AudioSegment.from_file(io.BytesIO(source))
+    if hasattr(source, "read"):
+        data = source.read()
+        return AudioSegment.from_file(io.BytesIO(data))
+    raise ValueError("Unsupported audio source")
+
+
+def _audio_to_vector(segment, frame_ms: int = 500) -> list[float]:
+    """Convert audio to a coarse energy vector for similarity comparison."""
+    # Normalize format
+    seg = segment.set_channels(1).set_frame_rate(16000)
+    samples = seg.get_array_of_samples()
+    frame_len = max(int(seg.frame_rate * frame_ms / 1000), 1)
+    vec = []
+    acc = 0
+    count = 0
+    for s in samples:
+        acc += abs(int(s))
+        count += 1
+        if count >= frame_len:
+            vec.append(acc / count)
+            acc = 0
+            count = 0
+    if count:
+        vec.append(acc / max(count, 1))
+    # Normalize vector magnitude to reduce loudness impact
+    if not vec:
+        return [0.0]
+    mean = sum(vec) / len(vec)
+    centered = [v - mean for v in vec]
+    norm = math.sqrt(sum(v * v for v in centered)) or 1.0
+    return [v / norm for v in centered]
+
+
+def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    if not vec_a or not vec_b:
+        return 0.0
+    n = min(len(vec_a), len(vec_b))
+    a = vec_a[:n]
+    b = vec_b[:n]
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(y * y for y in b)) or 1.0
+    return max(min(dot / (na * nb), 1.0), -1.0)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_embedding_model():
+    """Load a transformer encoder for audio embeddings."""
+    try:
+        from transformers import AutoProcessor, AutoModel  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency: install transformers and torch to compute embeddings.") from exc
+
+    model_name = "microsoft/wavlm-base-plus"
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model.eval()
+    return processor, model
+
+
+def _audio_to_embedding(segment) -> np.ndarray:
+    """Convert an audio segment to a transformer embedding (mean pooled)."""
+    seg = segment.set_channels(1).set_frame_rate(16000)
+    samples = np.asarray(seg.get_array_of_samples()).astype(np.float32)
+    if samples.size == 0:
+        return np.zeros((768,), dtype=np.float32)
+    # Normalize to [-1,1]
+    max_val = np.max(np.abs(samples))
+    if max_val > 0:
+        samples = samples / max_val
+
+    processor, model = _load_embedding_model()
+    with torch.no_grad():
+        inputs = processor(samples, sampling_rate=16000, return_tensors="pt")
+        outputs = model(**inputs)
+        hidden = outputs.last_hidden_state  # (1, T, D)
+        pooled = hidden.mean(dim=1).squeeze(0).cpu().numpy()
+    return pooled
+
+
+def _cues_to_timed_words(cues: list[dict]) -> list[tuple[str, float]]:
+    words = []
+    for cue in cues:
+        text = (cue.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(cue.get("start", 0.0))
+        end = float(cue.get("end", start))
+        tokens = text.split()
+        duration = max(end - start, 0.01)
+        step = duration / max(len(tokens), 1)
+        for idx, tok in enumerate(tokens):
+            words.append((tok.lower(), start + idx * step))
+    return words
+
+
+def _transcribe_with_whisper(audio_segment) -> list[tuple[str, float]]:
+    """Use Whisper (transformers pipeline already loaded) to get word + start time."""
+    asr = load_asr_pipeline()
+    seg = audio_segment.set_channels(1).set_frame_rate(16000)
+    samples = np.asarray(seg.get_array_of_samples()).astype(np.float32)
+    if samples.size == 0:
+        return []
+    max_val = np.max(np.abs(samples))
+    if max_val > 0:
+        samples = samples / max_val
+    result = asr(samples, return_timestamps="word")
+    words = []
+    for ch in result.get("chunks") or []:
+        w = (ch.get("text") or "").strip()
+        ts = ch.get("timestamp") or (None, None)
+        t0 = ts[0] if isinstance(ts, (list, tuple)) and len(ts) else None
+        if w and t0 is not None:
+            words.append((w.lower(), float(t0)))
+    # Fallback if no chunks
+    if not words and result.get("text"):
+        words.append((result["text"].strip().lower(), 0.0))
+    return words
+
+
+def _timed_alignment_score(expected: list[tuple[str, float]], observed: list[tuple[str, float]]):
+    """Match word order with time offsets; return similarity 0-1."""
+    if not expected or not observed:
+        return 0.0, 0.0, 0
+    exp_words = [w for w, _ in expected]
+    obs_words = [w for w, _ in observed]
+    matcher = difflib.SequenceMatcher(None, exp_words, obs_words)
+    blocks = matcher.get_matching_blocks()
+
+    matched = 0
+    deltas = []
+    for block in blocks:
+        a0, b0, size = block
+        for i in range(size):
+            exp_idx = a0 + i
+            obs_idx = b0 + i
+            if exp_idx < len(expected) and obs_idx < len(observed):
+                matched += 1
+                deltas.append(abs(expected[exp_idx][1] - observed[obs_idx][1]))
+
+    coverage = matched / max(len(exp_words), 1)
+    if deltas:
+        avg_dt = sum(deltas) / len(deltas)
+        # penalize offsets above 2s heavily
+        timing = max(0.0, 1.0 - (avg_dt / 2.0))
+    else:
+        timing = 0.0
+    score = coverage * timing
+    return score, coverage, timing
+
+
+def score_singing(song_path: Path, user_audio) -> tuple[float, float]:
+    """
+    Score by aligning words between the expected subtitles and the user's singing.
+    Uses Whisper to transcribe the user audio and compares word order/timing.
+    Returns (score_0_100, raw_similarity_0_1).
+    """
+    add_log("Scoring singing performance (alignment-based)...")
+    if "srt_text" not in st.session_state:
+        raise RuntimeError("Subtitles not available to align against.")
+    cues = parse_srt_cues(st.session_state["srt_text"])
+    expected_words = _cues_to_timed_words(cues)
+
+    user_seg = _segment_audio(user_audio)
+    observed_words = _transcribe_with_whisper(user_seg)
+
+    sim_raw, coverage, timing = _timed_alignment_score(expected_words, observed_words)
+    score = max(0.0, min(sim_raw * 100.0, 100.0))
+    add_log(f"Alignment score={score:.1f} (coverage={coverage:.2f}, timing={timing:.2f})")
+    return score, sim_raw
+
+
+def srt_to_webvtt(srt_text: str) -> str:
+    """Convert SRT cues into WebVTT format for native <track> captions."""
+    cues = parse_srt_cues(srt_text)
+
+    def to_vtt_timestamp(seconds: float) -> str:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:06.3f}".replace(",", ".")
+
+    lines = ["WEBVTT", ""]
+    for cue in cues:
+        start = to_vtt_timestamp(cue.get("start", 0.0))
+        end = to_vtt_timestamp(cue.get("end", cue.get("start", 0.0) + 1.0))
+        text = (cue.get("text") or "").strip() or "♪"
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def record_audio_component(label: str, key: str) -> Optional[bytes]:
+    """
+    Render an in-browser recorder component. Returns WAV bytes once recording stops.
+    """
+    value = karaoke_recorder_component(label=label, key=key, default={"status": "idle"})
+    if isinstance(value, dict) and value.get("status") == "recorded" and value.get("b64"):
+        try:
+            b64_str = value["b64"].split(",")[-1]
+            payload = base64.b64decode(b64_str)
+            trigger = value.get("trigger", "manual")
+            return payload, trigger
+        except Exception as exc:  # pragma: no cover
+            add_log(f"Could not decode recording: {exc}")
+    return None
+
+
+
+
 def _ensure_subtitles(video_path: str, stepper: Optional[StepProgress] = None):
     """Generate subtitles for the provided video path if not already cached."""
     if (
@@ -382,10 +630,12 @@ def _ensure_subtitles(video_path: str, stepper: Optional[StepProgress] = None):
         if stepper:
             stepper.update(1, 1.0, text="Step 2/3: Subtitles already cached")
             stepper.update(2, 1.0, text="Step 3/3: Ready to play with subtitles")
+        add_log("Subtitles loaded from cache")
         return
 
     if stepper:
         stepper.update(1, 0.0, text="Step 2/3: Preparing transcription...")
+    add_log("Transcribing audio to subtitles...")
     try:
         if stepper:
             stepper.update(1, 0.3, text="Step 2/3: Filtering audio for vocals...")
@@ -393,12 +643,13 @@ def _ensure_subtitles(video_path: str, stepper: Optional[StepProgress] = None):
         if stepper:
             stepper.update(1, 1.0, text="Step 2/3: Subtitles ready")
     except Exception as exc:
-        st.error(f"Could not generate subtitles: {exc}")
+        err = f"Could not generate subtitles: {exc}"
+        add_log(err)
+        st.error(err)
     else:
         st.session_state["srt_text"] = srt_text
         st.session_state["srt_path"] = srt_path
         st.session_state["srt_video_path"] = video_path
-        st.success(f"Subtitles saved to {srt_path}")
         add_log(f"Subtitles saved to {srt_path}")
         if stepper:
             stepper.update(2, 1.0, text="Step 3/3: Ready to play with subtitles")
@@ -409,11 +660,11 @@ st.write(
     "Paste a YouTube URL, download it to a temporary folder, and play it directly here."
 )
 
-url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
+url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...", value="https://www.youtube.com/watch?v=8AHCfZTRGiI&list=RD8AHCfZTRGiI&start_radio=1")
 
 if st.button("Download and show"):
     if not url.strip():
-        st.warning("Please provide a valid YouTube link.")
+        add_log("Please provide a valid YouTube link.")
     else:
         progress_bar = st.progress(0, text="Step 1/3: Starting download...")
         stepper = StepProgress(progress_bar, steps=3)
@@ -421,11 +672,12 @@ if st.button("Download and show"):
         try:
             video_path = download_video(url.strip(), progress_callback=_progress_hook(stepper, 0))
         except Exception as exc:
-            st.error(f"Could not download the video: {exc}")
+            err = f"Could not download the video: {exc}"
+            add_log(err)
+            st.error(err)
         else:
             stepper.update(0, 1.0, text="Step 1/3: Download complete")
             st.session_state["video_path"] = video_path
-            st.success(f"Downloaded to {video_path}")
             add_log(f"Downloaded to {video_path}")
             _ensure_subtitles(video_path, stepper)
         # leave progress bar visible to show completion state
@@ -445,19 +697,72 @@ if "video_path" in st.session_state:
             render_video_with_subtitles(path, st.session_state["srt_text"])
         else:
             st.video(str(path))
-        st.caption(f"Playing from: {path}")
         if st.session_state.get("last_play_logged") != str(path):
             add_log(f"Playing from: {path}")
             st.session_state["last_play_logged"] = str(path)
-
-        if st.session_state.get("srt_text") and st.session_state.get("srt_path"):
-            st.download_button(
-                label="Download subtitles (.srt)",
-                data=Path(st.session_state["srt_path"]).read_bytes(),
-                file_name=Path(st.session_state["srt_path"]).name,
-                mime="application/x-subrip",
-            )
     else:
-        st.info("Downloaded file was not found. Try downloading again.")
+        add_log("Downloaded file was not found. Try downloading again.")
 
 render_terminal()
+
+st.divider()
+st.subheader("Karaoke scoring")
+st.caption("Record yourself singing while the song plays.")
+
+
+def auto_score_if_ready():
+    version = st.session_state.get("recorded_singing_version")
+    last_scored = st.session_state.get("recorded_singing_scored_version")
+    video_path_val = st.session_state.get("video_path")
+    if not video_path_val:
+        return
+    path_obj = Path(video_path_val)
+    if not path_obj.exists():
+        add_log("Auto score skipped: video file not found.")
+        return
+    recording = st.session_state.get("recorded_singing")
+    if recording is None:
+        return
+
+    if version and (last_scored is None or version > last_scored):
+        try:
+            score, sim_raw = score_singing(path_obj, recording)
+        except Exception as exc:
+            msg = f"Auto score failed: {exc}"
+            add_log(msg)
+        else:
+            st.session_state["last_score"] = score
+            st.session_state["last_score_raw"] = sim_raw
+            st.session_state["recorded_singing_scored_version"] = version
+            add_log(f"Auto-scored singing (trigger={st.session_state.get('recorded_singing_trigger', 'auto')}): {score:.1f}")
+
+
+auto_score_if_ready()
+
+if st.button("Score my singing"):
+    if "video_path" not in st.session_state or not Path(st.session_state["video_path"]).exists():
+        msg = "No downloaded song found. Download a video first."
+        add_log(msg)
+        st.error(msg)
+    elif "recorded_singing" not in st.session_state or st.session_state.get("recorded_singing") is None:
+        msg = "Please play the video to record your singing first."
+        add_log(msg)
+        st.error(msg)
+    else:
+        try:
+            score, sim_raw = score_singing(
+                Path(st.session_state["video_path"]),
+                st.session_state["recorded_singing"],
+            )
+        except Exception as exc:
+            msg = f"Could not score singing: {exc}"
+            add_log(msg)
+            st.error(msg)
+        else:
+            st.session_state["last_score"] = score
+            st.session_state["last_score_raw"] = sim_raw
+            st.session_state["recorded_singing_scored_version"] = st.session_state.get("recorded_singing_version")
+
+if st.session_state.get("last_score") is not None:
+    st.metric("Similarity score", f"{st.session_state['last_score']:.1f} / 100")
+    st.caption(f"raw similarity={st.session_state.get('last_score_raw', 0):.3f}")

@@ -1,0 +1,219 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Karaoke Recorder</title>
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: transparent; }
+    .shell { padding: 0; }
+    .player-shell { width: 100%; max-width: 960px; margin: 0 auto; }
+    video { width: 100%; border-radius: 8px; }
+    .lyrics-board {
+      margin-top: 12px; padding: 14px; background: #0f1115; color: #f8f9fb;
+      border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,0.15); min-height: 88px;
+    }
+    .lyrics-current { font-size: 1.25rem; font-weight: 700; }
+    .lyrics-next { margin-top: 6px; color: #c3c7d1; font-size: 1rem; }
+    .rec-box { border: 1px solid #ddd; padding: 10px; border-radius: 8px; background: #f7f8fb; margin-top: 10px; }
+    .title { font-weight: 600; margin-bottom: 6px; }
+    .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    button { padding: 8px 12px; border: none; border-radius: 6px; color: #fff; cursor: pointer; }
+    .start { background: #e03a3e; }
+    .stop { background: #111827; }
+    .status { margin-top: 4px; color: #444; font-size: 0.9rem; }
+    .note { margin-top: 6px; color: #555; font-size: 0.9rem; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="player-shell" id="player-wrapper"></div>
+    <div class="rec-box" id="rec-box">
+      <div class="title" id="title">Recorder</div>
+      <div class="row" id="controls-row">
+        <button class="start" id="btn-start">Start</button>
+        <button class="stop" id="btn-stop" disabled>Stop</button>
+        <span class="status" id="status">Idle</span>
+      </div>
+      <div class="note" id="note"></div>
+    </div>
+  </div>
+  <script>
+    let mediaRecorder;
+    let chunks = [];
+    let videoEl = null;
+    let cues = [];
+    let stopReason = "manual";
+
+    function post(msg) {
+      window.parent.postMessage({ isStreamlitMessage: true, ...msg }, "*");
+    }
+
+    function setStatus(text) {
+      const statusEl = document.getElementById("status");
+      if (statusEl) statusEl.textContent = text;
+    }
+
+    async function ensureRecorder() {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") return mediaRecorder;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream);
+      mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      mediaRecorder.onstop = handleStop;
+      return mediaRecorder;
+    }
+
+    async function startRec(reason = "manual") {
+      chunks = [];
+      stopReason = reason;
+      try {
+        const rec = await ensureRecorder();
+        if (rec.state === "inactive") {
+          rec.start();
+          setStatus("Recording...");
+        }
+      } catch (err) {
+        setStatus("Mic error: " + err);
+      }
+    }
+
+    async function handleStop() {
+      setStatus("Processing...");
+      const blob = new Blob(chunks, { type: "audio/webm" });
+      const arrayBuffer = await blob.arrayBuffer();
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      const pcm = audioBuffer.getChannelData(0);
+
+      function encodeWAV(samples, sampleRate) {
+        const buffer = new ArrayBuffer(44 + samples.length * 2);
+        const view = new DataView(buffer);
+        function writeString(offset, str) {
+          for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+        }
+        writeString(0, 'RIFF');
+        view.setUint32(4, 36 + samples.length * 2, true);
+        writeString(8, 'WAVE');
+        writeString(12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeString(36, 'data');
+        view.setUint32(40, samples.length * 2, true);
+        let offset = 44;
+        for (let i = 0; i < samples.length; i++, offset += 2) {
+          let s = Math.max(-1, Math.min(1, samples[i]));
+          view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        }
+        return buffer;
+      }
+
+      const wavBuffer = encodeWAV(pcm, audioBuffer.sampleRate);
+      const wavBytes = new Uint8Array(wavBuffer);
+      let binary = '';
+      for (let i = 0; i < wavBytes.length; i++) binary += String.fromCharCode(wavBytes[i]);
+      const b64 = btoa(binary);
+      post({
+        type: "streamlit:setComponentValue",
+        value: { status: "recorded", trigger: stopReason, b64: "data:audio/wav;base64," + b64 },
+      });
+      setStatus("Recorded.");
+    }
+
+    function stopRec(reason = "manual") {
+      stopReason = reason;
+      if (mediaRecorder && mediaRecorder.state === "recording") {
+        mediaRecorder.stop();
+        mediaRecorder.stream.getTracks().forEach(t => t.stop());
+      }
+    }
+
+    function bindVideoLyrics(cuesData) {
+      cues = Array.isArray(cuesData) ? cuesData : [];
+      const lyricCurrent = document.getElementById("lyrics-current");
+      const lyricNext = document.getElementById("lyrics-next");
+      function update() {
+        if (!videoEl || !lyricCurrent || !lyricNext || !cues.length) return;
+        const t = videoEl.currentTime;
+        let idx = -1;
+        for (let i = 0; i < cues.length; i++) {
+          if (t >= cues[i].start && t <= cues[i].end) { idx = i; break; }
+          if (cues[i].start > t) break;
+        }
+        if (idx === -1) idx = cues.findIndex(c => c.start > t);
+        const currentCue = idx >= 0 ? cues[idx] : null;
+        const upcoming = idx >= 0 ? cues.slice(idx + 1, idx + 3) : cues.slice(0, 2);
+        lyricCurrent.textContent = currentCue && currentCue.text ? currentCue.text : "♪";
+        lyricNext.textContent = upcoming.length ? upcoming.map(c => c.text).filter(Boolean).join(" / ") : "";
+        requestAnimationFrame(update);
+      }
+      requestAnimationFrame(update);
+    }
+
+    function renderVideo(args) {
+      const { videoUrl, vttText, cues: cuesData, autoStartOnPlay } = args;
+      const wrapper = document.getElementById("player-wrapper");
+      wrapper.innerHTML = "";
+      if (!videoUrl) return;
+      const html = `
+        <video id="karaoke-video" controls>
+          <source src="${videoUrl}" type="video/mp4">
+          <track id="subtitle-track" kind="subtitles" srclang="en" default>
+          Your browser does not support the video tag.
+        </video>
+        <div class="lyrics-board">
+          <div class="lyrics-current" id="lyrics-current">♪</div>
+          <div class="lyrics-next" id="lyrics-next">...</div>
+        </div>
+      `;
+      wrapper.innerHTML = html;
+      videoEl = document.getElementById("karaoke-video");
+      const track = document.getElementById("subtitle-track");
+      if (track && vttText) {
+        const blob = new Blob([vttText], { type: "text/vtt" });
+        track.src = URL.createObjectURL(blob);
+        track.addEventListener("load", () => {
+          const [textTrack] = videoEl.textTracks || [];
+          if (textTrack) textTrack.mode = "showing";
+        });
+      }
+
+      bindVideoLyrics(cuesData || []);
+
+      if (autoStartOnPlay) {
+        videoEl.addEventListener("play", () => startRec("auto_play"));
+        videoEl.addEventListener("pause", () => stopRec("auto_pause"));
+        videoEl.addEventListener("ended", () => stopRec("auto_end"));
+        document.getElementById("controls-row")?.classList.add("hidden");
+        const note = document.getElementById("note");
+        if (note) note.textContent = "Recording starts with the video and stops when paused or finished.";
+      }
+    }
+
+    function onRender(event) {
+      const data = event.data;
+      if (!data || !data.type) return;
+      if (data.type === "streamlit:render") {
+        const args = data.args || {};
+        const { label, videoUrl, cues: cuesData, vttText, autoStartOnPlay } = args;
+        const titleEl = document.getElementById("title");
+        if (titleEl && label) titleEl.textContent = label;
+        renderVideo({ videoUrl, vttText, cues: cuesData, autoStartOnPlay });
+        const startBtn = document.getElementById("btn-start");
+        const stopBtn = document.getElementById("btn-stop");
+        if (startBtn) startBtn.onclick = startRec;
+        if (stopBtn) stopBtn.onclick = stopRec;
+        post({ type: "streamlit:setFrameHeight", height: videoUrl ? 720 : 260 });
+      }
+    }
+
+    window.addEventListener("message", onRender);
+    post({ type: "streamlit:componentReady", apiVersion: 1 });
+    post({ type: "streamlit:setFrameHeight", height: 260 });
+  </script>
+</body>
+</html>
