@@ -1,5 +1,4 @@
 import base64
-import json
 import http.server
 import threading
 import sys
@@ -10,53 +9,69 @@ import io
 import math
 import time
 import numpy as np
-import torch
 import difflib
 from typing import Callable, Optional
 
 import streamlit as st
 
 
-st.set_page_config(page_title="YouTube Loader", page_icon="📥")
-st.markdown(
-    """
-    <style>
-      body { background: linear-gradient(135deg, #0f172a 0%, #111827 40%, #0b1224 100%); color: #e5e7eb; }
-      section.main > div { padding-top: 12px; }
-      .block-container {
-        padding: 28px 24px 32px 24px;
-        border-radius: 14px;
-        background: rgba(255,255,255,0.02);
-        border: 1px solid rgba(255,255,255,0.04);
-        box-shadow: 0 10px 40px rgba(0,0,0,0.28);
-      }
-      h1, h2, h3, h4 { color: #f8fafc; }
-      .stButton>button {
-        background: linear-gradient(135deg, #22c55e, #10b981);
-        color: #0f172a;
-        border: none;
-        border-radius: 10px;
-        padding: 10px 16px;
-        font-weight: 700;
-        box-shadow: 0 10px 30px rgba(16,185,129,0.35);
-      }
-      .stButton>button:hover { filter: brightness(1.05); }
-      .stProgress > div > div {
-        background: linear-gradient(90deg, #3b82f6, #22c55e);
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def _is_running_in_streamlit() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx  # type: ignore
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
 
-MEDIA_ROOT = Path(tempfile.gettempdir()) / "karaoke_ano_novo"
-MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+
+STREAMLIT_ACTIVE = _is_running_in_streamlit()
+
+if STREAMLIT_ACTIVE:
+    st.set_page_config(page_title="Carregador do YouTube", page_icon="📥")
+    st.markdown(
+        """
+        <style>
+          body { background: linear-gradient(135deg, #0f172a 0%, #111827 40%, #0b1224 100%); color: #e5e7eb; }
+          section.main > div { padding-top: 12px; }
+          .block-container {
+            padding: 28px 24px 32px 24px;
+            border-radius: 14px;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.04);
+            box-shadow: 0 10px 40px rgba(0,0,0,0.28);
+          }
+          h1, h2, h3, h4 { color: #f8fafc; }
+          .stButton>button {
+            background: linear-gradient(135deg, #22c55e, #10b981);
+            color: #0f172a;
+            border: none;
+            border-radius: 10px;
+            padding: 10px 16px;
+            font-weight: 700;
+            box-shadow: 0 10px 30px rgba(16,185,129,0.35);
+          }
+          .stButton>button:hover { filter: brightness(1.05); }
+          .stProgress > div > div {
+            background: linear-gradient(90deg, #3b82f6, #22c55e);
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+DEFAULT_MEDIA_ROOT = Path(tempfile.gettempdir()) / "karaoke_ano_novo"
+DEFAULT_MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+DEFAULT_ASR_MODEL = "openai/whisper-tiny"
 
 COMPONENT_DIR = (Path(__file__).parent / "web_recorder").resolve()
-karaoke_recorder_component = st.components.v1.declare_component(
-    "karaoke_recorder",
-    path=str(COMPONENT_DIR),
-)
+if STREAMLIT_ACTIVE:
+    karaoke_recorder_component = st.components.v1.declare_component(
+        "karaoke_recorder",
+        path=str(COMPONENT_DIR),
+    )
+else:
+    karaoke_recorder_component = lambda *args, **kwargs: None  # type: ignore
+
+FALLBACK_LOGS: list[str] = []
 
 
 class StepProgress:
@@ -74,24 +89,70 @@ class StepProgress:
         self.bar.progress(value, text=text)
 
 
-if "logs" not in st.session_state:
-    st.session_state["logs"] = []
+if STREAMLIT_ACTIVE:
+    if "logs" not in st.session_state:
+        st.session_state["logs"] = []
+    if "video_temp_dir" not in st.session_state:
+        st.session_state["video_temp_dir"] = str(DEFAULT_MEDIA_ROOT)
+    if "subtitle_temp_dir" not in st.session_state:
+        st.session_state["subtitle_temp_dir"] = str(DEFAULT_MEDIA_ROOT)
+    if "asr_model_name" not in st.session_state:
+        st.session_state["asr_model_name"] = DEFAULT_ASR_MODEL
 
 
 def add_log(message: str):
-    logs = st.session_state.setdefault("logs", [])
-    logs.append(message)
-    # keep log bounded
-    if len(logs) > 200:
-        del logs[0]
+    if STREAMLIT_ACTIVE:
+        logs = st.session_state.setdefault("logs", [])
+        logs.append(message)
+        if len(logs) > 200:
+            del logs[0]
+    else:
+        FALLBACK_LOGS.append(message)
+        if len(FALLBACK_LOGS) > 200:
+            del FALLBACK_LOGS[0]
+
+
+def _ensure_directory(path_str: str, fallback: Path) -> Path:
+    """Create and return a resolved path; fallback to default on failure."""
+    try:
+        path = Path(path_str).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path.resolve()
+    except Exception as exc:
+        add_log(f"Não foi possível usar {path_str}: {exc}. Voltando para {fallback}.")
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback.resolve()
+
+
+def get_video_temp_dir() -> Path:
+    if not STREAMLIT_ACTIVE:
+        return _ensure_directory(str(DEFAULT_MEDIA_ROOT), DEFAULT_MEDIA_ROOT)
+    return _ensure_directory(st.session_state.get("video_temp_dir") or DEFAULT_MEDIA_ROOT, DEFAULT_MEDIA_ROOT)
+
+
+def get_subtitle_temp_dir() -> Path:
+    if not STREAMLIT_ACTIVE:
+        return _ensure_directory(str(DEFAULT_MEDIA_ROOT), DEFAULT_MEDIA_ROOT)
+    base = (
+        st.session_state.get("subtitle_temp_dir")
+        or st.session_state.get("video_temp_dir")
+        or DEFAULT_MEDIA_ROOT
+    )
+    return _ensure_directory(base, DEFAULT_MEDIA_ROOT)
+
+
+def get_asr_model_name() -> str:
+    if not STREAMLIT_ACTIVE:
+        return DEFAULT_ASR_MODEL
+    return st.session_state.get("asr_model_name", DEFAULT_ASR_MODEL)
 
 
 def render_terminal():
     st.divider()
     st.markdown("**Terminal**")
     logs = st.session_state.get("logs", [])
-    content = "\n".join(logs) if logs else "No events yet."
-    st.text_area("Logs", content, height=180, disabled=True)
+    content = "\n".join(logs) if logs else "Nenhum evento ainda."
+    st.text_area("Registros", content, height=180, disabled=True)
 
 
 def start_media_server(root: Path) -> str:
@@ -129,7 +190,7 @@ def start_media_server(root: Path) -> str:
     thread.start()
     base_url = f"http://127.0.0.1:{port}"
     st.session_state["media_server"] = {"server": server, "thread": thread, "root": str(root), "base": base_url}
-    add_log(f"Started media server at {base_url}")
+    add_log(f"Servidor de mídia iniciado em {base_url}")
     return base_url
 
 
@@ -149,17 +210,17 @@ def _streamlit_media_url(path: Path) -> Optional[str]:
                 import streamlit.runtime as rt  # type: ignore
                 mgr = rt.get_instance().media_file_manager  # type: ignore
             except Exception:
-                add_log("Streamlit media manager not available; falling back to local server")
+                add_log("Gerenciador de mídia do Streamlit indisponível; usando servidor local")
                 return None
 
     mimetype, _ = guess_type(str(path))
     try:
         media_id = mgr.add(str(path), mimetype or "application/octet-stream", file_name=path.name)
         url = mgr.get_url(media_id)
-        add_log(f"Serving via Streamlit media endpoint: {url}")
+        add_log(f"Servindo pelo endpoint de mídia do Streamlit: {url}")
         return url
     except Exception as exc:
-        add_log(f"Could not register media with Streamlit: {exc}")
+        add_log(f"Não foi possível registrar mídia no Streamlit: {exc}")
         return None
 
 
@@ -184,19 +245,19 @@ def _progress_hook(stepper: StepProgress, step_index: int = 0):
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             if total:
                 pct = min(max(downloaded / total, 0), 1)
-                stepper.update(step_index, pct, text=f"Step {step_index + 1}/3: Downloading... {pct*100:.1f}%")
+                stepper.update(step_index, pct, text=f"Etapa {step_index + 1}/3: Baixando... {pct*100:.1f}%")
         elif d.get("status") == "finished":
-            stepper.update(step_index, 1.0, text=f"Step {step_index + 1}/3: Download complete")
+            stepper.update(step_index, 1.0, text=f"Etapa {step_index + 1}/3: Download concluído")
     return hook
 
 
 def download_video(url: str, progress_callback: Optional[Callable] = None) -> str:
     """Download the YouTube video to a temp folder and return the file path."""
-    temp_root = MEDIA_ROOT
+    temp_root = get_video_temp_dir()
     try:
         import yt_dlp  # type: ignore
     except ModuleNotFoundError as exc:
-        raise RuntimeError("Missing dependency: install yt-dlp (e.g. pip install yt-dlp)") from exc
+        raise RuntimeError("Dependência ausente: instale yt-dlp (ex.: pip install yt-dlp).") from exc
 
     ydl_opts = {
         "outtmpl": str(temp_root / "%(id)s.%(ext)s"),
@@ -225,25 +286,25 @@ def download_video(url: str, progress_callback: Optional[Callable] = None) -> st
             final_path = matches[0]
 
     if not final_path.exists():
-        raise FileNotFoundError("Unable to locate the downloaded file.")
+        raise FileNotFoundError("Não foi possível localizar o arquivo baixado.")
 
     return str(final_path)
 
 
-@st.cache_resource(show_spinner="Loading speech-to-text model...")
-def load_asr_pipeline():
+@st.cache_resource(show_spinner="Carregando modelo de transcrição de voz...")
+def load_asr_pipeline(model_name: str):
     """Load a multilingual Whisper model for transcription."""
     try:
         from transformers import pipeline  # type: ignore
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Missing dependency: install transformers and torch (e.g. pip install transformers torch)."
+            "Dependência ausente: instale transformers e torch (ex.: pip install transformers torch)."
         ) from exc
 
     # Small model gives better multilingual quality and still runs locally on CPU (slower than tiny).
     return pipeline(
         "automatic-speech-recognition",
-        model="openai/whisper-tiny",
+        model=model_name,
         device="cpu",  # set to "cuda" if you have a GPU available
         chunk_length_s=None,  # let Whisper manage chunking to avoid experimental warnings
         ignore_warning=True,
@@ -254,11 +315,11 @@ def load_asr_pipeline():
     )
 
 
-@st.cache_data(show_spinner="Transcribing audio to subtitles...")
-def generate_subtitles(video_path: str) -> tuple[str, str]:
+@st.cache_data(show_spinner="Transcrevendo áudio para legendas...")
+def generate_subtitles(video_path: str, model_name: str, subtitle_dir: str) -> tuple[str, str]:
     """Generate SRT subtitles using Whisper and return (srt_text, srt_file_path)."""
     voice_boosted_path = enhance_voice_for_asr(video_path)
-    asr = load_asr_pipeline()
+    asr = load_asr_pipeline(model_name)
     result = asr(voice_boosted_path, return_timestamps="word")
 
     # Hugging Face Whisper returns chunks in a "chunks" list with start/end
@@ -288,13 +349,14 @@ def generate_subtitles(video_path: str) -> tuple[str, str]:
         lines.append(str(idx))
         lines.append(f"{to_srt_timestamp(start)} --> {to_srt_timestamp(end)}")
         text = (chunk.get("text") or "").strip()
-        lines.append(text or "[silence]")
+        lines.append(text or "[silêncio]")
         lines.append("")
 
     srt_text = "\n".join(lines).strip() + "\n"
 
     # Persist to temp for download/reuse
-    srt_path = Path(video_path).with_suffix(".srt")
+    target_dir = _ensure_directory(subtitle_dir, DEFAULT_MEDIA_ROOT)
+    srt_path = target_dir / f"{Path(video_path).stem}.srt"
     srt_path.write_text(srt_text, encoding="utf-8")
 
     return srt_text, str(srt_path)
@@ -335,7 +397,7 @@ def render_video_with_subtitles(video_path: Path, srt_text: str):
     vtt_text = srt_to_webvtt(srt_text)
 
     result = karaoke_recorder_component(
-        label="Recording with playback (starts when video plays)",
+        label="Gravando com reprodução (começa quando o vídeo tocar)",
         videoUrl=video_uri,
         cues=cues,
         vttText=vtt_text,
@@ -349,9 +411,9 @@ def render_video_with_subtitles(video_path: Path, srt_text: str):
             st.session_state["recorded_singing"] = base64.b64decode(b64_str)
             st.session_state["recorded_singing_trigger"] = result.get("trigger", "manual")
             st.session_state["recorded_singing_version"] = time.time()
-            add_log(f"Captured singing recording from playback (trigger={result.get('trigger', 'manual')})")
+            add_log(f"Gravação de voz capturada durante a reprodução (gatilho={result.get('trigger', 'manual')})")
         except Exception as exc:
-            add_log(f"Could not decode singing recording: {exc}")
+            add_log(f"Não foi possível decodificar a gravação da voz: {exc}")
 
 
 def parse_srt_cues(srt_text: str) -> list[dict]:
@@ -411,7 +473,7 @@ def _segment_audio(source) -> "AudioSegment":
     if hasattr(source, "read"):
         data = source.read()
         return AudioSegment.from_file(io.BytesIO(data))
-    raise ValueError("Unsupported audio source")
+    raise ValueError("Fonte de áudio não suportada")
 
 
 def _audio_to_vector(segment, frame_ms: int = 500) -> list[float]:
@@ -459,7 +521,7 @@ def _load_embedding_model():
     try:
         from transformers import AutoProcessor, AutoModel  # type: ignore
     except ModuleNotFoundError as exc:
-        raise RuntimeError("Missing dependency: install transformers and torch to compute embeddings.") from exc
+        raise RuntimeError("Dependência ausente: instale transformers e torch para gerar embeddings.") from exc
 
     model_name = "microsoft/wavlm-base-plus"
     processor = AutoProcessor.from_pretrained(model_name)
@@ -479,6 +541,11 @@ def _audio_to_embedding(segment) -> np.ndarray:
     if max_val > 0:
         samples = samples / max_val
 
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Dependência ausente: instale torch para gerar embeddings.") from exc
+
     processor, model = _load_embedding_model()
     with torch.no_grad():
         inputs = processor(samples, sampling_rate=16000, return_tensors="pt")
@@ -486,6 +553,78 @@ def _audio_to_embedding(segment) -> np.ndarray:
         hidden = outputs.last_hidden_state  # (1, T, D)
         pooled = hidden.mean(dim=1).squeeze(0).cpu().numpy()
     return pooled
+
+
+def _segment_to_samples(segment, target_rate: int = 16000) -> np.ndarray:
+    """Convert an AudioSegment to mono, normalized float samples."""
+    seg = segment.set_channels(1).set_frame_rate(target_rate)
+    samples = np.asarray(seg.get_array_of_samples()).astype(np.float32)
+    if samples.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    max_val = np.max(np.abs(samples))
+    if max_val > 0:
+        samples = samples / max_val
+    return samples
+
+
+def _stft_magnitude(samples: np.ndarray, fft_size: int = 2048, hop: int = 512) -> np.ndarray:
+    """Compute magnitude spectrogram normalized per frame."""
+    if samples.size == 0:
+        return np.zeros((1, fft_size // 2 + 1), dtype=np.float32)
+
+    window = np.hanning(fft_size).astype(np.float32)
+    frames = []
+    for start in range(0, len(samples), hop):
+        frame = samples[start : start + fft_size]
+        if frame.size == 0:
+            break
+        if frame.shape[0] < fft_size:
+            frame = np.pad(frame, (0, fft_size - frame.shape[0]))
+        spectrum = np.fft.rfft(frame * window)
+        frames.append(np.abs(spectrum))
+        if start + fft_size >= len(samples):
+            break
+
+    if not frames:
+        frame = np.pad(samples, (0, max(0, fft_size - samples.shape[0])))[:fft_size]
+        spectrum = np.fft.rfft(frame * window)
+        frames.append(np.abs(spectrum))
+
+    mags = np.vstack(frames)
+    norms = np.linalg.norm(mags, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return mags / norms
+
+
+def _fft_similarity_score(reference_seg, user_seg) -> tuple[float, float]:
+    """
+    Compare two audio segments using spectral similarity derived from FFT magnitudes.
+    Returns (score_0_100, similarity_0_1).
+    """
+    ref_samples = _segment_to_samples(reference_seg)
+    user_samples = _segment_to_samples(user_seg)
+    if ref_samples.size == 0 or user_samples.size == 0:
+        return 0.0, 0.0
+
+    max_len = min(ref_samples.shape[0], user_samples.shape[0])
+    if max_len <= 0:
+        return 0.0, 0.0
+    ref_samples = ref_samples[:max_len]
+    user_samples = user_samples[:max_len]
+
+    ref_spec = _stft_magnitude(ref_samples)
+    user_spec = _stft_magnitude(user_samples)
+    frames = min(ref_spec.shape[0], user_spec.shape[0])
+    if frames == 0:
+        return 0.0, 0.0
+    ref_spec = ref_spec[:frames]
+    user_spec = user_spec[:frames]
+
+    sims = np.sum(ref_spec * user_spec, axis=1)
+    sims = np.clip(sims, 0.0, 1.0)
+    spectral_similarity = float(np.mean(sims))
+    score = float(max(0.0, min(spectral_similarity * 100.0, 100.0)))
+    return score, spectral_similarity
 
 
 def _cues_to_timed_words(cues: list[dict]) -> list[tuple[str, float]]:
@@ -506,7 +645,7 @@ def _cues_to_timed_words(cues: list[dict]) -> list[tuple[str, float]]:
 
 def _transcribe_with_whisper(audio_segment) -> list[tuple[str, float]]:
     """Use Whisper (transformers pipeline already loaded) to get word + start time."""
-    asr = load_asr_pipeline()
+    asr = load_asr_pipeline(get_asr_model_name())
     seg = audio_segment.set_channels(1).set_frame_rate(16000)
     samples = np.asarray(seg.get_array_of_samples()).astype(np.float32)
     if samples.size == 0:
@@ -561,23 +700,15 @@ def _timed_alignment_score(expected: list[tuple[str, float]], observed: list[tup
 
 def score_singing(song_path: Path, user_audio) -> tuple[float, float]:
     """
-    Score by aligning words between the expected subtitles and the user's singing.
-    Uses Whisper to transcribe the user audio and compares word order/timing.
-    Returns (score_0_100, raw_similarity_0_1).
+    Score by comparing spectral content of the original audio and the user's singing.
+    Uses an FFT-based magnitude comparison to produce (score_0_100, spectral_similarity_0_1).
     """
-    add_log("Scoring singing performance (alignment-based)...")
-    if "srt_text" not in st.session_state:
-        raise RuntimeError("Subtitles not available to align against.")
-    cues = parse_srt_cues(st.session_state["srt_text"])
-    expected_words = _cues_to_timed_words(cues)
-
+    add_log("Pontuando a voz (similaridade espectral via FFT)...")
+    reference_seg = _segment_audio(song_path)
     user_seg = _segment_audio(user_audio)
-    observed_words = _transcribe_with_whisper(user_seg)
-
-    sim_raw, coverage, timing = _timed_alignment_score(expected_words, observed_words)
-    score = max(0.0, min(sim_raw * 100.0, 100.0))
-    add_log(f"Alignment score={score:.1f} (coverage={coverage:.2f}, timing={timing:.2f})")
-    return score, sim_raw
+    score, spectral_similarity = _fft_similarity_score(reference_seg, user_seg)
+    add_log(f"Pontuação FFT={score:.1f} (sobreposição espectral={spectral_similarity:.3f})")
+    return score, spectral_similarity
 
 
 def srt_to_webvtt(srt_text: str) -> str:
@@ -614,7 +745,7 @@ def record_audio_component(label: str, key: str) -> Optional[bytes]:
             trigger = value.get("trigger", "manual")
             return payload, trigger
         except Exception as exc:  # pragma: no cover
-            add_log(f"Could not decode recording: {exc}")
+            add_log(f"Não foi possível decodificar a gravação: {exc}")
     return None
 
 
@@ -622,92 +753,43 @@ def record_audio_component(label: str, key: str) -> Optional[bytes]:
 
 def _ensure_subtitles(video_path: str, stepper: Optional[StepProgress] = None):
     """Generate subtitles for the provided video path if not already cached."""
+    model_name = get_asr_model_name()
+    subtitle_dir = str(get_subtitle_temp_dir())
     if (
         st.session_state.get("srt_video_path") == video_path
         and st.session_state.get("srt_text")
+        and st.session_state.get("srt_model_name") == model_name
+        and st.session_state.get("srt_dir") == subtitle_dir
         and Path(st.session_state.get("srt_path", "")).exists()
     ):
         if stepper:
-            stepper.update(1, 1.0, text="Step 2/3: Subtitles already cached")
-            stepper.update(2, 1.0, text="Step 3/3: Ready to play with subtitles")
-        add_log("Subtitles loaded from cache")
+            stepper.update(1, 1.0, text="Etapa 2/3: Legendas já em cache")
+            stepper.update(2, 1.0, text="Etapa 3/3: Pronto para reproduzir com legendas")
+        add_log("Legendas carregadas do cache")
         return
 
     if stepper:
-        stepper.update(1, 0.0, text="Step 2/3: Preparing transcription...")
-    add_log("Transcribing audio to subtitles...")
+        stepper.update(1, 0.0, text="Etapa 2/3: Preparando transcrição...")
+    add_log("Transcrevendo áudio para gerar legendas...")
     try:
         if stepper:
-            stepper.update(1, 0.3, text="Step 2/3: Filtering audio for vocals...")
-        srt_text, srt_path = generate_subtitles(video_path)
+            stepper.update(1, 0.3, text="Etapa 2/3: Filtrando áudio para voz...")
+        srt_text, srt_path = generate_subtitles(video_path, model_name, subtitle_dir)
         if stepper:
-            stepper.update(1, 1.0, text="Step 2/3: Subtitles ready")
+            stepper.update(1, 1.0, text="Etapa 2/3: Legendas prontas")
     except Exception as exc:
-        err = f"Could not generate subtitles: {exc}"
+        err = f"Não foi possível gerar legendas: {exc}"
         add_log(err)
         st.error(err)
     else:
         st.session_state["srt_text"] = srt_text
         st.session_state["srt_path"] = srt_path
         st.session_state["srt_video_path"] = video_path
-        add_log(f"Subtitles saved to {srt_path}")
+        st.session_state["srt_model_name"] = model_name
+        st.session_state["srt_dir"] = subtitle_dir
+        add_log(f"Legendas salvas em {srt_path}")
         if stepper:
-            stepper.update(2, 1.0, text="Step 3/3: Ready to play with subtitles")
-
-
-st.title("YouTube video loader")
-st.write(
-    "Paste a YouTube URL, download it to a temporary folder, and play it directly here."
-)
-
-url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...", value="https://www.youtube.com/watch?v=8AHCfZTRGiI&list=RD8AHCfZTRGiI&start_radio=1")
-
-if st.button("Download and show"):
-    if not url.strip():
-        add_log("Please provide a valid YouTube link.")
-    else:
-        progress_bar = st.progress(0, text="Step 1/3: Starting download...")
-        stepper = StepProgress(progress_bar, steps=3)
-        stepper.update(0, 0.0, text="Step 1/3: Starting download...")
-        try:
-            video_path = download_video(url.strip(), progress_callback=_progress_hook(stepper, 0))
-        except Exception as exc:
-            err = f"Could not download the video: {exc}"
-            add_log(err)
-            st.error(err)
-        else:
-            stepper.update(0, 1.0, text="Step 1/3: Download complete")
-            st.session_state["video_path"] = video_path
-            add_log(f"Downloaded to {video_path}")
-            _ensure_subtitles(video_path, stepper)
-        # leave progress bar visible to show completion state
-
-if "video_path" in st.session_state:
-    path = Path(st.session_state["video_path"])
-    if path.exists():
-        if st.session_state.get("srt_video_path") != str(path):
-            progress_bar = st.progress(0, text="Step 1/3: Using existing download...")
-            stepper = StepProgress(progress_bar, steps=3)
-            stepper.update(0, 1.0, text="Step 1/3: Using existing download")
-            _ensure_subtitles(str(path), stepper)
-        else:
-            stepper = None
-
-        if "srt_text" in st.session_state:
-            render_video_with_subtitles(path, st.session_state["srt_text"])
-        else:
-            st.video(str(path))
-        if st.session_state.get("last_play_logged") != str(path):
-            add_log(f"Playing from: {path}")
-            st.session_state["last_play_logged"] = str(path)
-    else:
-        add_log("Downloaded file was not found. Try downloading again.")
-
-render_terminal()
-
-st.divider()
-st.subheader("Karaoke scoring")
-st.caption("Record yourself singing while the song plays.")
+            stepper.update(2, 1.0, text="Etapa 3/3: Pronto para reproduzir com legendas")
 
 
 def auto_score_if_ready():
@@ -718,7 +800,7 @@ def auto_score_if_ready():
         return
     path_obj = Path(video_path_val)
     if not path_obj.exists():
-        add_log("Auto score skipped: video file not found.")
+        add_log("Pontuação automática ignorada: arquivo de vídeo não encontrado.")
         return
     recording = st.session_state.get("recorded_singing")
     if recording is None:
@@ -726,43 +808,181 @@ def auto_score_if_ready():
 
     if version and (last_scored is None or version > last_scored):
         try:
-            score, sim_raw = score_singing(path_obj, recording)
+            with st.spinner("Pontuando sua voz..."):
+                score, sim_raw = score_singing(path_obj, recording)
         except Exception as exc:
-            msg = f"Auto score failed: {exc}"
+            msg = f"Pontuação automática falhou: {exc}"
             add_log(msg)
         else:
             st.session_state["last_score"] = score
-            st.session_state["last_score_raw"] = sim_raw
+            st.session_state["last_spectral_similarity"] = sim_raw
             st.session_state["recorded_singing_scored_version"] = version
-            add_log(f"Auto-scored singing (trigger={st.session_state.get('recorded_singing_trigger', 'auto')}): {score:.1f}")
+            add_log(f"Voz pontuada automaticamente (gatilho={st.session_state.get('recorded_singing_trigger', 'auto')}): {score:.1f}")
 
 
-auto_score_if_ready()
+def render_karaoke_page():
+    st.title("Carregador de vídeos do YouTube")
+    st.write(
+        "Cole a URL do YouTube, baixe para uma pasta temporária e reproduza aqui mesmo."
+    )
 
-if st.button("Score my singing"):
-    if "video_path" not in st.session_state or not Path(st.session_state["video_path"]).exists():
-        msg = "No downloaded song found. Download a video first."
-        add_log(msg)
-        st.error(msg)
-    elif "recorded_singing" not in st.session_state or st.session_state.get("recorded_singing") is None:
-        msg = "Please play the video to record your singing first."
-        add_log(msg)
-        st.error(msg)
-    else:
-        try:
-            score, sim_raw = score_singing(
-                Path(st.session_state["video_path"]),
-                st.session_state["recorded_singing"],
-            )
-        except Exception as exc:
-            msg = f"Could not score singing: {exc}"
+    url = st.text_input(
+        "URL do YouTube",
+        placeholder="https://www.youtube.com/watch?v=...",
+        value="https://www.youtube.com/watch?v=8AHCfZTRGiI&list=RD8AHCfZTRGiI&start_radio=1",
+    )
+
+    if st.button("Baixar e mostrar"):
+        if not url.strip():
+            add_log("Forneça um link válido do YouTube.")
+        else:
+            progress_bar = st.progress(0, text="Etapa 1/3: Iniciando download...")
+            stepper = StepProgress(progress_bar, steps=3)
+            stepper.update(0, 0.0, text="Etapa 1/3: Iniciando download...")
+            try:
+                video_path = download_video(url.strip(), progress_callback=_progress_hook(stepper, 0))
+            except Exception as exc:
+                err = f"Não foi possível baixar o vídeo: {exc}"
+                add_log(err)
+                st.error(err)
+            else:
+                stepper.update(0, 1.0, text="Etapa 1/3: Download concluído")
+                st.session_state["video_path"] = video_path
+                add_log(f"Baixado em {video_path}")
+                _ensure_subtitles(video_path, stepper)
+            # leave progress bar visible to show completion state
+
+    if "video_path" in st.session_state:
+        path = Path(st.session_state["video_path"])
+        if path.exists():
+            if (
+                st.session_state.get("srt_video_path") != str(path)
+                or st.session_state.get("srt_model_name") != get_asr_model_name()
+                or st.session_state.get("srt_dir") != str(get_subtitle_temp_dir())
+            ):
+                progress_bar = st.progress(0, text="Etapa 1/3: Usando download existente...")
+                stepper = StepProgress(progress_bar, steps=3)
+                stepper.update(0, 1.0, text="Etapa 1/3: Usando download existente")
+                _ensure_subtitles(str(path), stepper)
+            else:
+                stepper = None
+
+            if "srt_text" in st.session_state:
+                render_video_with_subtitles(path, st.session_state["srt_text"])
+            else:
+                st.video(str(path))
+            if st.session_state.get("last_play_logged") != str(path):
+                add_log(f"Reproduzindo de: {path}")
+                st.session_state["last_play_logged"] = str(path)
+        else:
+            add_log("Arquivo baixado não encontrado. Tente baixar novamente.")
+
+    st.divider()
+    st.subheader("Pontuação do karaokê")
+    st.caption("Grave sua voz enquanto a música toca. A pontuação usa similaridade espectral por FFT.")
+
+    auto_score_if_ready()
+
+    if st.button("Pontuar minha voz"):
+        if "video_path" not in st.session_state or not Path(st.session_state["video_path"]).exists():
+            msg = "Nenhuma música baixada encontrada. Baixe um vídeo antes."
+            add_log(msg)
+            st.error(msg)
+        elif "recorded_singing" not in st.session_state or st.session_state.get("recorded_singing") is None:
+            msg = "Toque o vídeo para gravar sua voz primeiro."
             add_log(msg)
             st.error(msg)
         else:
-            st.session_state["last_score"] = score
-            st.session_state["last_score_raw"] = sim_raw
-            st.session_state["recorded_singing_scored_version"] = st.session_state.get("recorded_singing_version")
+            try:
+                with st.spinner("Pontuando sua voz..."):
+                    score, sim_raw = score_singing(
+                        Path(st.session_state["video_path"]),
+                        st.session_state["recorded_singing"],
+                    )
+            except Exception as exc:
+                msg = f"Não foi possível pontuar a voz: {exc}"
+                add_log(msg)
+                st.error(msg)
+            else:
+                st.session_state["last_score"] = score
+                st.session_state["last_spectral_similarity"] = sim_raw
+                st.session_state["recorded_singing_scored_version"] = st.session_state.get("recorded_singing_version")
 
-if st.session_state.get("last_score") is not None:
-    st.metric("Similarity score", f"{st.session_state['last_score']:.1f} / 100")
-    st.caption(f"raw similarity={st.session_state.get('last_score_raw', 0):.3f}")
+    if st.session_state.get("last_score") is not None:
+        st.metric("Pontuação por FFT", f"{st.session_state['last_score']:.1f} / 100")
+        st.caption(f"sobreposição espectral={st.session_state.get('last_spectral_similarity', 0):.3f}")
+
+    render_terminal()
+
+
+def render_settings_page():
+    st.title("Configurações")
+    st.caption("Escolha onde os arquivos serão guardados e qual modelo de fala será usado.")
+
+    model_options = [
+        "openai/whisper-tiny",
+        "openai/whisper-base",
+        "openai/whisper-small",
+    ]
+    current_model = get_asr_model_name()
+    if current_model not in model_options:
+        model_options = [current_model] + model_options
+    try:
+        model_idx = model_options.index(current_model)
+    except ValueError:
+        model_idx = 0
+
+    with st.form("settings_form", clear_on_submit=False):
+        video_dir_input = st.text_input(
+            "Pasta temporária para vídeos baixados",
+            value=st.session_state.get("video_temp_dir", str(DEFAULT_MEDIA_ROOT)),
+            help="Novos downloads serão salvos aqui.",
+        )
+        subtitle_dir_input = st.text_input(
+            "Pasta temporária para legendas geradas",
+            value=st.session_state.get("subtitle_temp_dir", st.session_state.get("video_temp_dir", str(DEFAULT_MEDIA_ROOT))),
+            help="Arquivos SRT serão escritos aqui.",
+        )
+        model_choice = st.selectbox(
+            "Modelo de transcrição (voz para texto)",
+            options=model_options,
+            index=model_idx,
+            help="Modelos maiores são mais lentos, mas podem melhorar a qualidade da transcrição.",
+        )
+        submitted = st.form_submit_button("Salvar configurações")
+
+    if submitted:
+        st.session_state["video_temp_dir"] = video_dir_input.strip() or str(DEFAULT_MEDIA_ROOT)
+        st.session_state["subtitle_temp_dir"] = subtitle_dir_input.strip() or st.session_state["video_temp_dir"]
+        st.session_state["asr_model_name"] = model_choice
+        video_dir = get_video_temp_dir()
+        subtitle_dir = get_subtitle_temp_dir()
+        add_log(f"Configurações atualizadas: vídeos em {video_dir}, legendas em {subtitle_dir}, modelo={model_choice}")
+        st.success("Configurações salvas. Novos downloads/transcrições usarão esses locais.")
+        st.info(
+            f"Vídeos -> {video_dir}\nLegendas -> {subtitle_dir}\nModelo -> {model_choice}",
+            icon="ℹ️",
+        )
+
+    st.markdown("**Configuração atual**")
+    st.code(
+        f"Vídeos: {get_video_temp_dir()}\nLegendas: {get_subtitle_temp_dir()}\nModelo: {get_asr_model_name()}",
+        language="text",
+    )
+
+
+def run_app():
+    page = st.sidebar.radio("Navegação", ["Karaokê", "Configurações"], index=0)
+    with st.sidebar:
+        st.caption(f"Vídeos: {get_video_temp_dir()}")
+        st.caption(f"Legendas: {get_subtitle_temp_dir()}")
+        st.caption(f"Modelo: {get_asr_model_name()}")
+
+    if page == "Karaokê":
+        render_karaoke_page()
+    else:
+        render_settings_page()
+
+
+if STREAMLIT_ACTIVE:
+    run_app()
