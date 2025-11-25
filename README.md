@@ -3,7 +3,7 @@
 Aplicativo Streamlit para baixar vídeos do YouTube, gerar legendas com Whisper e gravar/pontuar seu karaokê usando similaridade espectral (FFT).
 
 ## Requisitos
-- Python 3.13+
+- Python 3.10+
 - ffmpeg disponível no PATH para evitar avisos do pydub
 - Dependências: `pip install -r requirements.txt`
 
